@@ -6,7 +6,7 @@
 
 ## What This Project Is
 
-**404Whisper** is a general-purpose, platform-agnostic command-line messaging application built on the [Session](https://getsession.org) decentralised messaging protocol. It allows users to send and receive end-to-end encrypted messages, participate in group chats, and share file attachments — entirely from a terminal, with no phone number, email, or centralised account required.
+**404Whisper** is a general-purpose, platform-agnostic messaging application built on the [Session](https://getsession.org) decentralised messaging protocol. It allows users to send and receive end-to-end encrypted messages, participate in group chats, and share file attachments — with no phone number, email, or centralised account required. The UI is browser-based, served locally. Users share their Session ID with each other out-of-band (copy-paste) — there is no in-app user search or discovery.
 
 The project is written in **Python 3.9+** and implements the Session network protocol natively in Python, using the open-source [session.js](https://github.com/sessionjs/client) library as a protocol reference. It does **not** wrap or depend on the official Session desktop/mobile clients, Node.js, Bun, or any non-Python runtime.
 
@@ -28,6 +28,8 @@ The project is written in **Python 3.9+** and implements the Session network pro
 - Read receipts or disappearing messages
 - Multi-device sync
 - Open Groups (SOGS)
+- In-app user search or discovery — users share Session IDs out-of-band (copy-paste) only
+- QR code sharing (deferred)
 - Push notifications
 - Native GUI desktop wrapper (the web frontend covers this use case)
 - Exposing the API on a non-localhost interface (this is a local-only tool)
@@ -136,6 +138,8 @@ The codebase is structured as eight discrete layers. Each has a single responsib
 - All FastAPI route handlers must be `async`; no blocking calls on the event loop
 - The frontend communicates only with `localhost` — this is not a networked web service
 - Views: conversation list, active chat, onboarding/setup flow, group creation modal, attachment progress indicator
+- Every input that accepts a Session ID must validate the format client-side (66 hex chars, `05` prefix) and display a clear inline error if invalid — no network call should be made with a malformed ID
+- The user's own Session ID must be prominently displayed and one-click copyable from the UI (e.g. in a profile/settings panel) so they can share it out-of-band
 
 ---
 
@@ -215,6 +219,8 @@ Copilot should understand these concepts when suggesting code in this project:
 A user's identity is their public key. A Session ID looks like:
 `057aeb66e45660c3bdfb7c62706f6440226af43ec13f3b6f899c1dd4db1b8fce5b`
 It is the X25519 public key, hex-encoded, with a `05` prefix.
+
+Users share their Session ID with each other entirely out-of-band — copy-paste is the only supported method. There is no in-app search, username lookup, or QR code. Every UI surface that asks for a recipient (new DM, add group member) must accept a raw Session ID string and validate that it is well-formed (66 hex characters, `05` prefix) before submitting.
 
 **Mnemonic / Seed Phrase**
 Session uses its own custom word list (not BIP39). A seed phrase encodes the 32-byte private key as a sequence of human-readable words. The encode/decode logic must match Session's implementation exactly.
