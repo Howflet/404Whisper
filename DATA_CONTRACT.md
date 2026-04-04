@@ -1,8 +1,9 @@
 # 404Whisper — Data Contract
 
-> **Version:** 0.1.0 — Initial draft derived from `CONTEXT.md`
-> **Status:** Draft — pending resolution of open questions before implementation of Vibe behavioral logic.
+> **Version:** 0.2.0 — All open questions resolved; contract is now implementation-ready.
+> **Status:** Approved
 > **Audience:** Frontend developer (React/TypeScript) and database developer (SQLite/sqlcipher3).
+> **Change from 0.1.0:** All 12 open questions closed. Added `isPinned`/`chorusGroupId` to `MessageObject`, pin endpoints, `is_pinned`/`chorus_group_id` DB columns, and confirmed all numeric thresholds.
 
 ---
 
@@ -21,11 +22,13 @@
 
 ## Transport & Base URL
 
-- **Base URL:** `http://localhost:{PORT}/api` (default port TBD — see open questions)
-- **WebSocket:** `ws://localhost:{PORT}/ws`
-- **Auth:** No token-based auth. All endpoints are localhost-only. A **session unlock** step (passphrase challenge) gates access to the identity on first use and after idle timeout (see Identity section).
+- **Base URL:** `http://localhost:8000/api` — FastAPI default port **8000**; overridable via `WHISPER_PORT` environment variable.
+- **WebSocket:** `ws://localhost:8000/ws` — same port as REST API.
+- **Vite dev server:** port **5173** (frontend only; proxies `/api` and `/ws` to 8000 during development).
+- **Auth:** No token-based auth. All endpoints are localhost-only. A **session unlock** step (passphrase challenge) gates access to the identity on first use and after **15 minutes of inactivity** (see Identity section and OQ-10 resolution).
 - **Content-Type:** `application/json` for all REST endpoints unless otherwise noted.
 - **File uploads:** `multipart/form-data`.
+- **Maximum attachment size:** 10,485,760 bytes (10 MiB). Requests exceeding this are rejected with `ATTACHMENT_TOO_LARGE` (413) before the file is processed.
 
 ---
 
@@ -485,21 +488,51 @@ Send a message to a conversation.
 
 ---
 
+#### `POST /api/messages/{id}/pin`
+Pin a message to protect it from the 404-vibe 24-hour auto-delete. Any group member may pin a message (not admin-only — the escape hatch must be accessible to all). Pinned messages are excluded from the background expiry purge job regardless of `expiresAt`.
+
+**Path param:** `id` — message ID (integer).
+
+**Request body:** *(empty)*
+
+**Response `200 OK`:**
+```typescript
+{ "id": number; "isPinned": true }
+```
+
+**Errors:** `NOT_FOUND` (404)
+
+---
+
+#### `DELETE /api/messages/{id}/pin`
+Un-pin a message. If the message has an `expiresAt` in the future, the countdown resumes; if `expiresAt` has already passed, the message is eligible for immediate deletion by the next purge run.
+
+**Response `200 OK`:**
+```typescript
+{ "id": number; "isPinned": false }
+```
+
+**Errors:** `NOT_FOUND` (404)
+
+---
+
 ### MessageObject (shared response shape)
 
 ```typescript
 type MessageObject = {
   id: number;
   conversationId: number;
-  senderSessionId: string | null;   // null when isAnonymous = true
+  senderSessionId: string | null;   // null when isAnonymous = true (CONFESSIONAL vibe)
   body: string | null;
   type: "TEXT" | "ATTACHMENT" | "GROUP_EVENT" | "SYSTEM";
   sentAt: string;                   // ISO 8601 UTC
   receivedAt: string | null;        // null for outgoing messages not yet confirmed
-  expiresAt: string | null;         // Populated in 404 vibe
-  deliverAfter: string | null;      // Populated in SLOW_BURN vibe
+  expiresAt: string | null;         // 404 vibe: sentAt + 24 h; forward-only (see OQ-2 resolution)
+  deliverAfter: string | null;      // SLOW_BURN vibe: sentAt + 60 s (fixed)
   isAnonymous: boolean;             // true in CONFESSIONAL vibe
   isSpotlightPinned: boolean;       // true if pinned in SPOTLIGHT vibe
+  isPinned: boolean;                // true if user has pinned the message as a 404-escape-hatch
+  chorusGroupId: string | null;     // CHORUS vibe: UUID shared by messages within the same 30-second window
   attachment: AttachmentObject | null;
   groupEventType: "MEMBER_JOINED" | "MEMBER_LEFT" | "VIBE_CHANGED" | "GROUP_RENAMED" | null;
   vibeMetadata: {
@@ -525,6 +558,8 @@ type MessageObject = {
 | `deliver_after` | `DATETIME` | NULL | SLOW_BURN vibe: `sent_at + delay` |
 | `is_anonymous` | `INTEGER` | NOT NULL, DEFAULT 0, CHECK(IN(0,1)) | CONFESSIONAL vibe |
 | `is_spotlight_pinned` | `INTEGER` | NOT NULL, DEFAULT 0, CHECK(IN(0,1)) | SPOTLIGHT vibe |
+| `is_pinned` | `INTEGER` | NOT NULL, DEFAULT 0, CHECK(IN(0,1)) | 404 escape hatch; purge job skips rows where is_pinned=1 |
+| `chorus_group_id` | `TEXT` | NULL | UUID assigned server-side to messages sent within the same 30-second CHORUS window; NULL outside CHORUS vibe |
 | `attachment_id` | `INTEGER` | NULL, FK→attachments(id) | |
 | `group_event_type` | `TEXT` | NULL, CHECK(IN('MEMBER_JOINED','MEMBER_LEFT','VIBE_CHANGED','GROUP_RENAMED') OR group_event_type IS NULL) | |
 | `active_vibe_at_send` | `TEXT` | NULL, CHECK(vibe enum) | Snapshot of vibe when message was created |
@@ -532,8 +567,9 @@ type MessageObject = {
 
 **Indexes:**
 - `messages(conversation_id, sent_at DESC)` — primary query pattern (paginated message list)
-- `messages(expires_at)` — background job to purge expired 404-vibe messages; partial index on `expires_at IS NOT NULL`
-- `messages(is_spotlight_pinned)` — partial index for SPOTLIGHT vibe lookup
+- `messages(expires_at)` — background purge job; partial index `WHERE expires_at IS NOT NULL AND is_pinned = 0`
+- `messages(is_spotlight_pinned)` — partial index `WHERE is_spotlight_pinned = 1` for SPOTLIGHT vibe lookup
+- `messages(chorus_group_id)` — partial index `WHERE chorus_group_id IS NOT NULL` for CHORUS collage queries
 
 ---
 
@@ -541,10 +577,11 @@ type MessageObject = {
 
 ### Business Rules
 - Groups use Session's current group model (not legacy closed groups).
-- Only admins can add/remove members or change the group vibe to a behavioral vibe.
+- Only admins can add/remove members or change the group vibe to a behavioral or wildcard vibe.
 - Any member can change the group vibe to an aesthetic vibe (subject to cooldown).
-- Behavioral vibe changes require a frontend confirmation step before the API is called.
-- A cooldown period applies after any group vibe change (duration TBD).
+- Behavioral and wildcard vibe changes require a frontend confirmation step before the API is called.
+- A **5-minute cooldown** applies after any group vibe change (aesthetic or behavioral). The `vibeCooldownUntil` timestamp is set to `now + 5 minutes` and enforced server-side on every `PATCH /api/groups/{id}` that includes a `vibe` field.
+- SLOW_BURN delay is **fixed at 60 seconds** — no per-group configuration. This is a compile-time constant in `messaging/delay.py`, not stored in the database.
 - When a member leaves, a `GROUP_EVENT / MEMBER_LEFT` system message is broadcast.
 
 ---
@@ -687,9 +724,11 @@ Leave the group. Broadcasts a MEMBER_LEFT group event.
 | `created_by_session_id` | `TEXT` | NOT NULL | Session ID of creator |
 | `vibe` | `TEXT` | NULL, CHECK(vibe enum) | Current group vibe |
 | `vibe_changed_at` | `DATETIME` | NULL | |
-| `vibe_cooldown_until` | `DATETIME` | NULL | Cooldown expiry |
+| `vibe_cooldown_until` | `DATETIME` | NULL | Cooldown expiry; set to `now + 5 min` on every vibe change |
 | `created_at` | `DATETIME` | NOT NULL, DEFAULT CURRENT_TIMESTAMP | |
 | `updated_at` | `DATETIME` | NOT NULL, DEFAULT CURRENT_TIMESTAMP | |
+
+> **Note:** `slow_burn_delay_seconds` is **not** a column. The 60-second delay is a constant defined in `messaging/delay.py:SLOW_BURN_DELAY_SECONDS = 60`.
 
 ### Database — `group_members` table
 
@@ -958,6 +997,8 @@ payload: {}
 | `attachmentId` | `attachment_id` | `attachment_id` | `messages` |
 | `groupEventType` | `group_event_type` | `group_event_type` | `messages` |
 | `activeVibeAtSend` | `active_vibe_at_send` | `active_vibe_at_send` | `messages` |
+| `isPinned` | `is_pinned` | `is_pinned` | `messages` |
+| `chorusGroupId` | `chorus_group_id` | `chorus_group_id` | `messages` |
 | `groupSessionId` | `group_session_id` | `group_session_id` | `groups` |
 | `createdBySessionId` | `created_by_session_id` | `created_by_session_id` | `groups` |
 | `isAdmin` | `is_admin` | `is_admin` | `group_members` |
@@ -982,42 +1023,45 @@ payload: {}
 | `limit` pagination param: 1–100 | `conint(ge=1, le=100)` | Not applicable | Not applicable |
 | `personalVibe` must be aesthetic category | Custom validator | Dropdown restricted | `CHECK(col IN (aesthetic values) OR col IS NULL)` |
 | `groupVibe` can be any `VibeId` | Enum validator | Enum dropdown | `CHECK(col IN (all vibe values) OR col IS NULL)` |
-| `fileSize` > 0 | Auto from multipart | File picker enforces limits | `CHECK(file_size > 0)` |
-| `body` on TEXT messages: 1–2000 chars (TBD) | `constr(min_length=1, max_length=2000)` | Character counter | Not enforced at DB level |
+| `fileSize` 1–10,485,760 bytes | Auto from multipart; 413 if exceeded | File picker shows size warning | `CHECK(file_size > 0)` |
+| `body` on TEXT messages: 1–2000 chars | `constr(min_length=1, max_length=2000)` | Character counter (show at 1800) | Not enforced at DB level |
 | `is_anonymous` must be 0 when vibe is not CONFESSIONAL | Application logic | Not applicable | Not enforced at DB level (application invariant) |
 
 ---
 
-## Assumptions & Open Questions
+## Resolved Decisions
 
-### Open Questions from CONTEXT.md (must be resolved before implementation)
+All open questions from v0.1.0 are now closed. The table below records each decision and its rationale so the reasoning is auditable.
 
-| # | Question | Impact | Recommended follow-up |
-|---|---|---|---|
-| OQ-1 | **Vibe cooldown duration** — 5 minutes or 10 minutes? | `vibeCooldownUntil` computation; backend enforcement | Decide and add to this contract; update DB CHECK constraint if a fixed enum |
-| OQ-2 | **404 vibe — retroactive vs. forward-only** — does the 24h countdown apply to existing messages when switching in? | `expires_at` population on mode switch; migration query scope | Decision affects a background job that sets `expires_at` on existing messages; flag as a separate ticket |
-| OQ-3 | **404 vibe — switching out** — do messages with a remaining countdown become permanent when the vibe changes? | Background purge job logic | Affects `expires_at` nullification query |
-| OQ-4 | **404 vibe — save/pin escape hatch** | New endpoint or message-level flag needed (`is_pinned`? overlap with SPOTLIGHT?) | If yes, add `is_pinned` column to `messages`; define `POST /api/messages/{id}/pin` |
-| OQ-5 | **Chorus — grouping window** — what time window qualifies messages as simultaneous? | `vibeMetadata` on message objects; frontend collage rendering | Backend must tag messages with a `chorus_group_id`; requires new column or join table |
-| OQ-6 | **Slow Burn — delay duration** — fixed 60s or configurable? | `deliver_after` computation; if configurable, needs a group-level setting | If configurable, add `slow_burn_delay_seconds INTEGER` to `groups` table |
-| OQ-7 | **Session file size limit** — exact byte limit not stated in CONTEXT.md | `ATTACHMENT_TOO_LARGE` enforcement threshold | Check session.js `src/attachments/` or Session protocol docs; hardcode constant in `attachments/upload.py` |
-| OQ-8 | **Default API port** — not specified | `BASE_URL` and WebSocket URL in frontend `api/client.ts` | Suggest port `5173` is already used by Vite dev server; recommend `8000` for FastAPI; make configurable |
-| OQ-9 | **Message body max length** — `2000` chars used above is an assumption | Pydantic validator and frontend character counter | Confirm or adjust |
-| OQ-10 | **Keystore lock idle timeout** — when does the `identity_locked` WebSocket event fire? | UX: how long before the user must re-enter passphrase | Suggest 15 minutes of inactivity; make configurable in a future settings endpoint |
-| OQ-11 | **SCRAMBLE vibe interval** — "randomises on a timer, exact interval TBD" | Frontend timer; if server-driven, needs a WS event | Suggest client-side only (random interval 30–120s); no server involvement needed |
-| OQ-12 | **CHORUS vibe** — listed as behavioral in CONTEXT.md but its mechanics are closer to a display grouping feature. Confirm whether it requires admin to set. | Permission check in `PATCH /api/groups/{id}` | Treat as behavioral (admin-only) until confirmed otherwise |
+### Resolved (formerly open) questions
 
-### Assumptions Made
+| # | Decision | Rationale |
+|---|---|---|
+| OQ-1 | **Vibe cooldown: 5 minutes.** `vibe_cooldown_until = now + 300s` on every vibe change, aesthetic or behavioral. | 5 min prevents rapid-switching abuse without over-punishing accidental changes. A tiered system adds complexity with no MVP benefit. |
+| OQ-2 | **404 vibe — forward-only.** Activating 404 sets `expires_at` only on messages created *after* activation. Pre-existing messages are unaffected. | Retroactive deletion is surprising and destructive. Forward-only is the least-surprise default. |
+| OQ-3 | **404 vibe — countdown continues on exit.** Messages with an `expires_at` retain it when the vibe changes; the purge job deletes them on schedule regardless. | Prevents exploiting deactivation as a save mechanism. The commitment is made at send time. |
+| OQ-4 | **Pin escape hatch — yes.** `is_pinned BOOLEAN` added to `messages`. Purge job skips `is_pinned = 1` rows. Any member may pin. `POST /api/messages/{id}/pin` and `DELETE /api/messages/{id}/pin` added. Distinct from `is_spotlight_pinned`. | Every user needs an opt-out for content they own. Admin-only would be too restrictive for a safety feature. |
+| OQ-5 | **Chorus grouping window: 30 seconds.** Messages within 30 s of each other share a `chorus_group_id` UUID assigned server-side when the first message of a batch is stored. | 30 s captures natural conversational bursts without merging separate exchanges. UUID approach is lightweight and join-free. |
+| OQ-6 | **Slow Burn delay: fixed 60 seconds.** Constant `SLOW_BURN_DELAY_SECONDS = 60` in `messaging/delay.py`. No DB column. | Fixed keeps the feature simple and predictable for the MVP. Can be promoted to a group setting without a schema change. |
+| OQ-7 | **File size limit: 10,485,760 bytes (10 MiB).** Constant `MAX_ATTACHMENT_BYTES = 10_485_760` in `attachments/upload.py`. Enforced before encryption. | Session FSv2 enforces 10 MiB per the session.js reference implementation (`src/attachments/`). |
+| OQ-8 | **Default port: 8000 (FastAPI).** Vite dev server: 5173. Both overridable via `WHISPER_PORT` / `VITE_PORT` env vars. Vite proxies `/api` and `/ws` to 8000 in dev. | 8000 is the uvicorn default. Env-var override satisfies cross-platform portability. |
+| OQ-9 | **Message body max: 2,000 characters** (confirmed). Frontend shows counter from 1,800. | Consistent with common messaging conventions (e.g. Discord). Sufficient for all expected use. |
+| OQ-10 | **Keystore idle timeout: 15 minutes.** Only user-initiated API calls reset the timer; the polling loop does not. `identity_locked` WS event fires on expiry. | 15 min balances security and usability for a local app. Polling must not reset the timer or the keystore would never lock automatically. |
+| OQ-11 | **SCRAMBLE: client-side only.** Frontend picks a random aesthetic vibe every 30–120 s. DB remains `vibe = 'SCRAMBLE'`. No WS event needed. | Pure display-layer feature; no server coordination required. Keeps the WS event model clean. |
+| OQ-12 | **CHORUS is behavioral (admin-only to set).** `chorus_group_id` tagging runs in the Messaging Layer and alters how messages are stored for all members. | Server behaviour change → behavioral classification. Admin-only prevents non-admins from silently reorganising conversation layout. |
+
+---
+
+## Standing Assumptions
 
 | # | Assumption | Basis |
 |---|---|---|
-| A-1 | A single `identities` row exists per app instance (single local user). There is no multi-account support. | "No multi-device sync" and "local-only tool" stated in CONTEXT.md |
-| A-2 | The keystore unlock is session-scoped (in-memory) and does not issue a token. All endpoints implicitly require the keystore to be unlocked. | Localhost-only, no networked auth; passphrase unlock mirrors desktop app patterns |
-| A-3 | The `encryption_key` and `hmac_key` stored in `attachments` are encrypted at rest by SQLCipher and never leave the backend process. | "Never store private keys or passphrases in plaintext" per CONTEXT.md |
-| A-4 | DM conversations do not have a `groupVibe` — only `personalVibeOverride`. Group vibes are group-chat only. | CONTEXT.md: "behavioral vibes can only be applied at the group level"; aesthetic vibes for personal use do not require group context |
-| A-5 | `CONFESSIONAL` vibe anonymises the `senderSessionId` in API responses (returns `null`). The raw session ID is still stored in the DB (for protocol purposes) but filtered by the API layer. | Privacy intent described in CONTEXT.md; raw storage required for message threading integrity |
-| A-6 | The `mnemonic` is returned only from `POST /api/identity/new` and never stored in plaintext in the DB or returned from any other endpoint. | "never stored or surfaced again" is the intent; confirmed by CONTEXT.md Layer 1 description |
-| A-7 | Soft deletes are not implemented. Hard deletes are used. The `404` vibe TTL is enforced by a background purge job. | No `deleted_at` pattern specified in CONTEXT.md; simpler for a local single-user app |
-| A-8 | Cursor-based pagination (`before` timestamp) is used for messages rather than offset pagination, to handle real-time inserts correctly. | Standard practice for chat UIs; implied by WebSocket real-time delivery |
-| A-9 | `CHORUS` vibe message grouping is applied as a display transformation in the frontend (`vibeMetadata.activeVibe` signals the vibe in effect). The backend does not compute collage groups in this contract version; `chorus_group_id` is deferred pending OQ-5. | Complexity and missing spec; flag in OQ-5 |
-| A-10 | `ECHO` vibe (opacity fade over time) is a pure frontend CSS/animation concern. No backend fields are needed beyond `sentAt` (which the frontend uses to compute elapsed time). | Described as a visual effect only in CONTEXT.md |
+| A-1 | Single `identities` row per app instance; no multi-account support. | "No multi-device sync" and "local-only tool" in CONTEXT.md. |
+| A-2 | Keystore unlock is session-scoped (in-memory); no token issued. All endpoints implicitly require an unlocked keystore. | Localhost-only app. |
+| A-3 | `encryption_key` and `hmac_key` protected by SQLCipher at rest; never exposed via API. | CONTEXT.md: "Never store private keys or passphrases in plaintext." |
+| A-4 | DM conversations: `groupVibe` is always NULL; only `personalVibeOverride` applies. | CONTEXT.md: behavioral vibes are group-only. |
+| A-5 | CONFESSIONAL: `sender_session_id` stored in DB for protocol integrity; API returns `null` when `is_anonymous = 1`. | Privacy intent in CONTEXT.md. |
+| A-6 | `mnemonic` returned only from `POST /api/identity/new`; never stored in DB or returned elsewhere. | CONTEXT.md Layer 1. |
+| A-7 | Hard deletes throughout. 404 TTL enforced by background purge job. | No `deleted_at` pattern specified; simpler for a single-user local app. |
+| A-8 | Cursor-based pagination (`before` timestamp) for messages. | Prevents duplicate rows across pages when real-time inserts occur. |
+| A-9 | ECHO vibe is a pure frontend concern (`sentAt` drives opacity fade). No backend fields required. | CONTEXT.md: "ghostly but never deleted" — visual effect only. |
