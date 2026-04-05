@@ -1,15 +1,24 @@
 """
-storage/database.py — Connection-managing Database class.
+storage/database.py — Database connection manager.
 
-Wraps sqlite3 (or sqlcipher3 in production) and delegates schema setup to
-storage/db.py.  Higher layers (API routes, messaging, etc.) use this class
-to get a database connection; they call functions from storage/queries.py
-to read and write data.
+What this file does
+-------------------
+Manages opening and closing the SQLite database file on disk.
+
+Think of it as the "key to the building":
+  - In development (no sqlcipher3 installed): opens the plain .db file.
+  - In production (sqlcipher3 installed): opens the *encrypted* .db file using
+    a passphrase derived from the user's unlock passphrase (Argon2).
+
+The ``Database`` class is used by ``storage/db.py``'s ``get_db()`` function,
+which is called automatically by FastAPI before each HTTP request.
+
+You will almost never need to import this class directly — use ``get_db()``
+(from ``storage.db``) instead, which handles open/close for you.
 
 Development vs. production:
   - Development: plain sqlite3, no passphrase encryption.
   - Production:  sqlcipher3 with Argon2-derived passphrase key.
-    Swap the two commented lines in _get_connection() when ready.
 """
 
 from __future__ import annotations
@@ -22,7 +31,11 @@ try:
 except ImportError:
     _sqlcipher3 = None  # Falls back to plain sqlite3 in development / CI
 
-from .db import init_schema
+# Re-export both so that any module importing from storage.database
+# gets everything it needs — no need to also import from storage.db.
+# The cross-layer tests (test_cross_layer.py) access SCHEMA_SQL and
+# init_schema directly via pkg("storage.database").
+from .db import init_schema, SCHEMA_SQL
 
 
 class Database:
@@ -59,11 +72,15 @@ class Database:
         """
         if _sqlcipher3 is not None:
             # Production: encrypted DB using sqlcipher3.
-            conn = _sqlcipher3.connect(self.db_path)
+            # check_same_thread=False allows FastAPI's async machinery (which may
+            # hand off work to a thread pool) to reuse the same connection.
+            conn = _sqlcipher3.connect(self.db_path, check_same_thread=False)
             conn.execute(f"PRAGMA key = '{self.passphrase}'")
         else:
             # Development / CI: plain sqlite3, no encryption.
-            conn = sqlite3.connect(self.db_path)
+            # check_same_thread=False is required when Starlette's TestClient runs
+            # the ASGI app in a background thread (common in contract/WS tests).
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         return conn

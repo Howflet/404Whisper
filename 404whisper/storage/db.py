@@ -1,15 +1,35 @@
 """
-storage/db.py — Schema definition and initialization.
+storage/db.py — Database schema definition and startup helpers.
 
-This module owns the single source of truth for the SQLite schema.
-It is imported by:
-  - The integration-test fixture (tests/integration/conftest.py) to spin up
-    a fresh in-memory database for every test.
-  - The Database class (storage/database.py) to initialize the on-disk file.
+What this file does
+-------------------
+This file is the *single source of truth* for the database structure.
+It defines all 7 tables (as SQL) and provides two helper functions:
+
+  - ``init_schema(conn)`` — run all CREATE TABLE statements on any connection.
+    Used both by production startup and by tests to spin up a fresh DB.
+
+  - ``get_db()`` — a FastAPI "dependency": called once per HTTP request to hand
+    the route handler an open, schema-initialized connection.  After the request
+    finishes the connection is closed automatically.
+
+Table overview (think of each as a spreadsheet tab):
+┌──────────────────┬─────────────────────────────────────────────────────────┐
+│ Table            │ What it stores                                          │
+├──────────────────┼─────────────────────────────────────────────────────────┤
+│ identities       │ The local user (one row per app install).               │
+│ contacts         │ Remote users the local user knows about.                │
+│ groups           │ Group chats (each has its own network Session ID).      │
+│ group_members    │ Who is in which group + their admin status.             │
+│ conversations    │ A chat thread — either DM (1-to-1) or GROUP.           │
+│ messages         │ Individual messages inside a conversation.              │
+│ attachments      │ Files attached to messages (encrypted, on file server). │
+└──────────────────┴─────────────────────────────────────────────────────────┘
 
 Why a separate module?
   Keeping schema SQL here makes it easy to run the exact same CREATE TABLE
-  statements in both tests (plain sqlite3) and production (sqlcipher3).
+  statements in both tests (plain sqlite3) and production (sqlcipher3),
+  with zero duplication.
 """
 
 # ---------------------------------------------------------------------------
@@ -41,7 +61,7 @@ CREATE TABLE IF NOT EXISTS identities (
 -- ── contacts ──────────────────────────────────────────────────────────────
 -- Remote Session IDs the user knows about.
 -- accepted=0 means a pending contact request; accepted=1 means confirmed.
--- Hard delete (no soft delete) — deleting a contact does NOT cascade to conversations.
+-- Hard delete (no soft delete) — deleting a contact preserves the conversation history (A-7).
 CREATE TABLE IF NOT EXISTS contacts (
     id           INTEGER PRIMARY KEY,
     session_id   TEXT    UNIQUE NOT NULL,
@@ -81,6 +101,43 @@ CREATE TABLE IF NOT EXISTS group_members (
     FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE
 );
 
+-- ── messages ──────────────────────────────────────────────────────────────
+-- A single message in a conversation.  sender_session_id is NULL when the
+-- CONFESSIONAL vibe is active and the sender chose to stay anonymous (OQ-12).
+-- Vibe-specific columns:
+--   expires_at         → 404 vibe: message self-destructs 24 h after sent_at
+--   deliver_after      → SLOW_BURN vibe: message hidden for 60 s after sent_at
+--   is_anonymous       → CONFESSIONAL vibe: 1 when sender identity is hidden
+--   is_spotlight_pinned → SPOTLIGHT vibe: 1 when pinned by spotlight
+--   is_pinned          → 404 escape hatch: admin can pin to prevent expiry
+--   chorus_group_id    → CHORUS vibe: UUID grouping messages in 30-s windows
+--   active_vibe_at_send → snapshot of the group vibe at the moment of sending
+--
+-- NOTE: This table is declared before the conv table in the script.
+-- SQLite allows FK forward-references at DDL time — the FK is only enforced
+-- at DML time (INSERT/UPDATE/DELETE) when both tables exist.
+CREATE TABLE IF NOT EXISTS messages (
+    id                  INTEGER PRIMARY KEY,
+    conversation_id     INTEGER NOT NULL,
+    sender_session_id   TEXT,
+    body                TEXT,
+    type                TEXT    NOT NULL DEFAULT 'TEXT'
+                                CHECK(type IN ('TEXT','ATTACHMENT','GROUP_EVENT','SYSTEM')),
+    sent_at             TEXT    NOT NULL,
+    received_at         TEXT,
+    expires_at          TEXT,
+    deliver_after       TEXT,
+    is_anonymous        INTEGER NOT NULL DEFAULT 0,
+    is_spotlight_pinned INTEGER NOT NULL DEFAULT 0,
+    is_pinned           INTEGER NOT NULL DEFAULT 0,
+    chorus_group_id     TEXT,
+    attachment_id       INTEGER,
+    group_event_type    TEXT    CHECK(group_event_type IN
+                                     ('MEMBER_JOINED','MEMBER_LEFT','VIBE_CHANGED','GROUP_RENAMED')),
+    active_vibe_at_send TEXT,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+);
+
 -- ── conversations ─────────────────────────────────────────────────────────
 -- A conversation is either a DM (1-to-1) or a GROUP chat.
 -- The CHECK constraint enforces that exactly one of contact_session_id / group_id
@@ -105,39 +162,6 @@ CREATE TABLE IF NOT EXISTS conversations (
         (type = 'DM'    AND contact_session_id IS NOT NULL AND group_id IS NULL) OR
         (type = 'GROUP' AND group_id IS NOT NULL            AND contact_session_id IS NULL)
     )
-);
-
--- ── messages ──────────────────────────────────────────────────────────────
--- A single message in a conversation.  sender_session_id is NULL when the
--- CONFESSIONAL vibe is active and the sender chose to stay anonymous (OQ-12).
--- Vibe-specific columns:
---   expires_at         → 404 vibe: message self-destructs 24 h after sent_at
---   deliver_after      → SLOW_BURN vibe: message hidden for 60 s after sent_at
---   is_anonymous       → CONFESSIONAL vibe: 1 when sender identity is hidden
---   is_spotlight_pinned → SPOTLIGHT vibe: 1 when pinned by spotlight
---   is_pinned          → 404 escape hatch: admin can pin to prevent expiry
---   chorus_group_id    → CHORUS vibe: UUID grouping messages in 30-s windows
---   active_vibe_at_send → snapshot of the group vibe at the moment of sending
-CREATE TABLE IF NOT EXISTS messages (
-    id                  INTEGER PRIMARY KEY,
-    conversation_id     INTEGER NOT NULL,
-    sender_session_id   TEXT,
-    body                TEXT,
-    type                TEXT    NOT NULL DEFAULT 'TEXT'
-                                CHECK(type IN ('TEXT','ATTACHMENT','GROUP_EVENT','SYSTEM')),
-    sent_at             TEXT    NOT NULL,
-    received_at         TEXT,
-    expires_at          TEXT,
-    deliver_after       TEXT,
-    is_anonymous        INTEGER NOT NULL DEFAULT 0,
-    is_spotlight_pinned INTEGER NOT NULL DEFAULT 0,
-    is_pinned           INTEGER NOT NULL DEFAULT 0,
-    chorus_group_id     TEXT,
-    attachment_id       INTEGER,
-    group_event_type    TEXT    CHECK(group_event_type IN
-                                     ('MEMBER_JOINED','MEMBER_LEFT','VIBE_CHANGED','GROUP_RENAMED')),
-    active_vibe_at_send TEXT,
-    FOREIGN KEY (conversation_id) REFERENCES conversations(id)
 );
 
 -- ── attachments ───────────────────────────────────────────────────────────

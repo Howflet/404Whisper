@@ -1,9 +1,84 @@
 """
-storage/queries.py — All database CRUD operations.
+storage/queries.py — All database CRUD operations for 404Whisper.
 
-Every function here takes an open sqlite3.Connection as its first argument.
-This design keeps the functions stateless and easy to test: the test fixture
-just passes an in-memory connection, and production code passes the real file.
+What is this file?
+------------------
+Think of this file as the "clerk" for our app's database. Every time the app
+needs to read or write data — create a user, list messages, delete a contact —
+it calls a function from this file. No SQL is written anywhere else.
+
+How it works (plain-English version):
+  1. The database stores everything in tables (like Excel sheets): identities,
+     contacts, groups, messages, attachments, conversations.
+  2. Every function below takes an open ``db`` connection as its first argument.
+     Think of ``db`` as an open door to the database.
+  3. Functions return plain Python dicts (or lists of dicts) so callers don't
+     need to know anything about SQLite.
+
+CRUD — what it means:
+  Create → INSERT  (add a new row)
+  Read   → SELECT  (fetch one or many rows)
+  Update → UPDATE  (change columns on an existing row)
+  Delete → DELETE  (remove a row)
+
+──────────────────────────────────────────────────────────────────────────────
+Function index  (group → function name → brief purpose)
+──────────────────────────────────────────────────────────────────────────────
+IDENTITIES (the local user — one row ever)
+  create_identity          Insert a new identity (session_id + optional name).
+  get_identity             Fetch identity by session_id → dict or None.
+  update_identity          Change display_name or personal_vibe.
+
+CONTACTS (remote users the local user knows about)
+  create_contact           Add a new contact (accepted=0 by default = pending).
+  get_contact              Fetch one contact by session_id → dict or None.
+  update_contact           Rename a contact or mark them accepted.
+  delete_contact           Hard-delete a contact (conversation history kept).
+  list_contacts            List all contacts, optionally filtered by accepted.
+  upsert_contact           Safe insert-or-update (used by the messaging layer).
+
+CONVERSATIONS (a chat thread — either 1-to-1 DM or a GROUP)
+  create_dm_conversation   Start a 1-to-1 chat with a contact.
+  create_group_conversation Start a group chat thread.
+  get_conversation         Fetch one conversation by id → dict or None.
+  list_conversations       All conversations, most-recently-active first.
+  update_conversation      Update vibe, unread count, last_message_at, etc.
+  delete_conversation      Hard-delete a conversation + all its messages.
+  get_conversation_by_contact Find a DM thread by the contact's session_id.
+  get_conversation_by_group   Find a group thread by the group's integer PK.
+  update_conversation_unread  Set unread count directly (e.g. mark all read).
+  increment_conversation_unread Atomically add 1 to unread count (no race).
+
+GROUPS (a chat room with its own network identity)
+  create_group             Create a new group row.
+  get_group                Fetch one group by integer id → dict or None.
+  list_groups              All groups, newest first.
+  update_group             Rename group or change/clear its vibe.
+  delete_group             Hard-delete group + members; conversation survives.
+  get_group_by_session_id  Find a group by its 66-char network hex address.
+
+GROUP MEMBERS (who is in which group)
+  add_group_member         Add a user to a group (optionally as admin).
+  remove_group_member      Remove a user from a group (no-op if not there).
+  list_group_members       All members of a group, oldest joiner first.
+
+MESSAGES (a single message in a conversation)
+  create_message           Insert a message with any vibe-specific fields.
+  get_message              Fetch one message by id → dict or None.
+  list_messages            Messages in a conversation, newest first + cursor.
+  save_message             Atomic: insert message + bump conversation timestamp.
+  pin_message              Set is_pinned=1 (404-vibe escape hatch).
+  unpin_message            Clear is_pinned=0.
+  delete_message           Hard-delete a single message.
+  list_expired_messages    Fetch 404-vibe messages past their 24-h TTL.
+  purge_expired_messages   Batch-delete all expired messages → returns count.
+
+ATTACHMENTS (a file attached to a message)
+  create_attachment        Insert attachment row before the message exists.
+  get_attachment           Fetch one attachment by id → dict or None.
+  update_attachment        Change status, upload_url, message_id, cache path.
+  delete_attachment        Hard-delete an attachment row.
+──────────────────────────────────────────────────────────────────────────────
 
 Naming conventions (match data contract § Naming Conventions):
   - Python parameter names: snake_case   (session_id, display_name)
@@ -518,7 +593,7 @@ def create_message(
     conversation_id: int,
     sender_session_id: Optional[str] = None,
     body: Optional[str] = None,
-    type: str = "TEXT",           # noqa: A002 — shadows builtin, matches data contract
+    type: str = "TEXT",  # pylint: disable=redefined-builtin  # shadows builtin, matches data contract
     sent_at: str,
     **extra,
 ) -> int:
@@ -682,12 +757,11 @@ def create_attachment(
     """
     optional = {k: v for k, v in extra.items() if k in _ATTACHMENT_OPTIONAL_COLS}
 
-    base_cols = ["file_name", "file_size", "mime_type", "status", "created_at", "updated_at"]
-    base_vals = [file_name, file_size, mime_type, status, "datetime('now')", "datetime('now')"]
     extra_cols = list(optional.keys())
     extra_vals = list(optional.values())
 
-    # Use datetime('now') as a SQL expression, not a string — build it properly.
+    # Build the full column list: required cols + optional cols + timestamp cols.
+    # datetime('now') is a SQL expression, not a string — inject it directly, not as a bind param.
     all_cols = ["file_name", "file_size", "mime_type", "status"] + extra_cols + ["created_at", "updated_at"]
     placeholders = ", ".join(["?"] * (4 + len(extra_cols))) + ", datetime('now'), datetime('now')"
     col_list = ", ".join(all_cols)
@@ -721,3 +795,475 @@ def update_attachment(
     sql, values = _build_update("attachments", "id", _ALLOWED, fields)
     db.execute(sql, [*values, attachment_id])
     db.commit()
+
+
+# ===========================================================================
+# Extended single-row lookups
+# ===========================================================================
+
+def get_contact(db: sqlite3.Connection, *, session_id: str) -> Optional[dict]:
+    """
+    Fetch a single contact by session_id, or None if not found.
+
+    Used by route handlers to check existence before updates/deletes.
+    """
+    row = db.execute(
+        "SELECT * FROM contacts WHERE session_id = ?", (session_id,)
+    ).fetchone()
+    return _row_to_dict(row)
+
+
+def get_message(db: sqlite3.Connection, *, message_id: int) -> Optional[dict]:
+    """
+    Fetch a single message by primary key, or None if not found.
+
+    Used by the messaging layer to retrieve a message after inserting it,
+    and by pin/unpin routes to confirm the message exists.
+    """
+    row = db.execute(
+        "SELECT * FROM messages WHERE id = ?", (message_id,)
+    ).fetchone()
+    return _row_to_dict(row)
+
+
+def get_attachment(db: sqlite3.Connection, *, attachment_id: int) -> Optional[dict]:
+    """
+    Fetch a single attachment row by primary key, or None if not found.
+
+    Used by attachment routes to look up metadata before serving a download.
+    Note: encryption_key and hmac_key are raw bytes — never include them
+    in API responses.
+    """
+    row = db.execute(
+        "SELECT * FROM attachments WHERE id = ?", (attachment_id,)
+    ).fetchone()
+    return _row_to_dict(row)
+
+
+# ===========================================================================
+# Upsert — for the messaging layer (network-received contacts)
+# ===========================================================================
+
+def upsert_contact(
+    db: sqlite3.Connection,
+    *,
+    session_id: str,
+    display_name: Optional[str] = None,
+    accepted: int = 0,
+) -> None:
+    """
+    Insert a contact row, or update it if session_id already exists.
+
+    Used by the messaging layer when a message arrives from an unknown sender —
+    the sender is automatically added as a pending contact (accepted=0).
+
+    Unlike create_contact() which raises IntegrityError on duplicates,
+    this function is safe to call multiple times for the same session_id:
+      - On conflict: only updates display_name if the new value is non-NULL,
+        preserving the existing name when None is passed.
+      - accepted is NOT overwritten on conflict — a user who already accepted
+        a contact keeps that status even if the network re-delivers the sender.
+
+    Args:
+        session_id:   66-char hex Session ID of the remote user.
+        display_name: Optional display name from the sender's profile.
+        accepted:     0 (pending) for network-originated contacts; 1 for local adds.
+    """
+    db.execute(
+        """
+        INSERT INTO contacts (session_id, display_name, accepted, created_at, updated_at)
+        VALUES (?, ?, ?, datetime('now'), datetime('now'))
+        ON CONFLICT(session_id) DO UPDATE SET
+            display_name = COALESCE(excluded.display_name, contacts.display_name),
+            updated_at   = datetime('now')
+        """,
+        (session_id, display_name, accepted),
+    )
+    db.commit()
+
+
+# ===========================================================================
+# save_message — atomic message + conversation-stats update
+# ===========================================================================
+
+def save_message(
+    db: sqlite3.Connection,
+    *,
+    conversation_id: int,
+    sender_session_id: Optional[str] = None,
+    body: Optional[str] = None,
+    type: str = "TEXT",           # noqa: A002
+    sent_at: str,
+    **extra,
+) -> int:
+    """
+    Insert a message row and bump the conversation's last_message_at in one call.
+
+    This is the preferred write path for both outgoing and incoming messages.
+    It keeps the conversation list sorted correctly without a separate update call.
+
+    Equivalent to calling create_message() followed by update_conversation()
+    but in a single logical operation.
+
+    Returns:
+        The integer primary key (id) of the new message row.
+
+    See create_message() for the full list of accepted **extra keyword arguments.
+    """
+    # Insert the message first.
+    msg_id = create_message(
+        db,
+        conversation_id=conversation_id,
+        sender_session_id=sender_session_id,
+        body=body,
+        type=type,
+        sent_at=sent_at,
+        **extra,
+    )
+    # Bump the conversation's last_message_at so it floats to the top of the list.
+    update_conversation(db, conversation_id=conversation_id, last_message_at=sent_at)
+    return msg_id
+
+
+# ===========================================================================
+# update_conversation_unread — dedicated unread count setter
+# ===========================================================================
+
+def update_conversation_unread(
+    db: sqlite3.Connection,
+    *,
+    conversation_id: int,
+    unread_count: int,
+) -> None:
+    """
+    Set the unread message count on a conversation directly.
+
+    Prefer this over update_conversation() when only the unread count is
+    changing — it's faster and more explicit.
+
+    The polling loop calls this after marking all received messages as read:
+        update_conversation_unread(db, conversation_id=conv_id, unread_count=0)
+
+    Args:
+        conversation_id: Primary key of the conversation to update.
+        unread_count:    New unread count (use 0 to mark all as read).
+    """
+    db.execute(
+        "UPDATE conversations SET unread_count = ? WHERE id = ?",
+        (unread_count, conversation_id),
+    )
+    db.commit()
+
+
+# ===========================================================================
+# delete_conversation — hard delete conversation + its messages
+# ===========================================================================
+
+def delete_conversation(db: sqlite3.Connection, *, conversation_id: int) -> None:
+    """
+    Hard-delete a conversation and all of its messages.
+
+    Messages are deleted first because the messages.conversation_id FK has
+    no ON DELETE CASCADE — SQLite with PRAGMA foreign_keys = ON will raise
+    an IntegrityError if we try to delete the conversation first.
+
+    Data-contract note: attachments linked to deleted messages are NOT
+    automatically removed from the file server — the caller is responsible
+    for cleaning up remote uploads if needed.
+    """
+    # Remove messages in this conversation first (no FK cascade).
+    db.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
+    # Then remove the conversation itself.
+    db.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+    db.commit()
+
+
+# ===========================================================================
+# delete_attachment — remove a single attachment row
+# ===========================================================================
+
+def delete_attachment(db: sqlite3.Connection, *, attachment_id: int) -> None:
+    """
+    Hard-delete an attachment row.
+
+    Callers are responsible for removing the encrypted file from the
+    Session file server before calling this, if it was successfully uploaded.
+    """
+    db.execute("DELETE FROM attachments WHERE id = ?", (attachment_id,))
+    db.commit()
+
+
+# ===========================================================================
+# Lookup helpers — find rows by alternate keys (used by messaging / groups)
+# ===========================================================================
+
+def get_group_by_session_id(
+    db: sqlite3.Connection,
+    *,
+    group_session_id: str,
+) -> Optional[dict]:
+    """
+    Fetch a group by its on-network Session ID (the 66-char hex string).
+
+    Why this exists:
+        Incoming network messages reference the group by its Session ID, not by
+        the integer primary key that the DB assigns.  This lookup bridges the gap.
+
+    Args:
+        group_session_id: The 66-char hex string stored in groups.group_session_id.
+
+    Returns:
+        Group dict, or None if no such group exists locally.
+
+    Example:
+        group = get_group_by_session_id(db, group_session_id="05abc…")
+        if group is None:
+            # We received a message for an unknown group — ignore or request sync.
+            pass
+    """
+    row = db.execute(
+        "SELECT * FROM groups WHERE group_session_id = ?", (group_session_id,)
+    ).fetchone()
+    return _row_to_dict(row)
+
+
+def get_conversation_by_contact(
+    db: sqlite3.Connection,
+    *,
+    contact_session_id: str,
+) -> Optional[dict]:
+    """
+    Find the DM conversation linked to a specific contact's Session ID.
+
+    Why this exists:
+        When the polling loop receives an incoming DM, it knows the sender's
+        Session ID but not the conversation's integer ID.  This lookup finds
+        the right conversation so the message can be written to the correct row.
+
+    Args:
+        contact_session_id: The sender's Session ID (66-char hex).
+
+    Returns:
+        Conversation dict, or None if no DM conversation exists for this contact.
+
+    Example:
+        conv = get_conversation_by_contact(db, contact_session_id="05bbb…")
+        if conv is None:
+            conv_id = create_dm_conversation(db, contact_session_id="05bbb…")
+        else:
+            conv_id = conv["id"]
+    """
+    row = db.execute(
+        "SELECT * FROM conversations WHERE type = 'DM' AND contact_session_id = ?",
+        (contact_session_id,),
+    ).fetchone()
+    return _row_to_dict(row)
+
+
+def get_conversation_by_group(
+    db: sqlite3.Connection,
+    *,
+    group_id: int,
+) -> Optional[dict]:
+    """
+    Find the GROUP conversation linked to a specific group's primary key.
+
+    Why this exists:
+        The groups layer creates a group row and a companion conversation row.
+        To write messages or update unread counts, callers need the conversation's
+        integer ID — this function retrieves it from the group's PK.
+
+    Args:
+        group_id: The integer primary key of the group (groups.id).
+
+    Returns:
+        Conversation dict, or None if no conversation exists for this group.
+
+    Example:
+        conv = get_conversation_by_group(db, group_id=42)
+        if conv:
+            save_message(db, conversation_id=conv["id"], ...)
+    """
+    row = db.execute(
+        "SELECT * FROM conversations WHERE type = 'GROUP' AND group_id = ?",
+        (group_id,),
+    ).fetchone()
+    return _row_to_dict(row)
+
+
+# ===========================================================================
+# Delete helpers — explicit removals for groups and individual messages
+# ===========================================================================
+
+def delete_group(db: sqlite3.Connection, *, group_id: int) -> None:
+    """
+    Hard-delete a group and all of its members.
+
+    The group_members table has ON DELETE CASCADE, so members are removed
+    automatically when the group row is deleted.  No manual cleanup needed.
+
+    Data-contract note: the companion conversation row is NOT deleted — the
+    conversation history is preserved even after the group is gone (same
+    principle as contact deletion, assumption A-7).
+
+    Args:
+        group_id: The integer primary key of the group to delete.
+
+    Example:
+        # Admin disbands a group
+        delete_group(db, group_id=42)
+    """
+    db.execute("DELETE FROM groups WHERE id = ?", (group_id,))
+    db.commit()
+
+
+def delete_message(db: sqlite3.Connection, *, message_id: int) -> None:
+    """
+    Hard-delete a single message by primary key.
+
+    Used by:
+      - The 404-vibe TTL purge job (purge_expired_messages calls this per row,
+        or the batch version deletes them all at once).
+      - Any future moderation / admin-delete flow.
+
+    Callers are responsible for checking is_pinned before calling — this
+    function will delete pinned messages if called directly.
+
+    Args:
+        message_id: The integer primary key of the message to delete.
+
+    Example:
+        expired = list_expired_messages(db, now_iso=now.isoformat())
+        for msg in expired:
+            delete_message(db, message_id=msg["id"])
+    """
+    db.execute("DELETE FROM messages WHERE id = ?", (message_id,))
+    db.commit()
+
+
+# ===========================================================================
+# Atomic counter — increment unread count without a read-modify-write cycle
+# ===========================================================================
+
+def increment_conversation_unread(
+    db: sqlite3.Connection,
+    *,
+    conversation_id: int,
+) -> None:
+    """
+    Atomically increment the unread message counter on a conversation by 1.
+
+    Why this is better than update_conversation_unread():
+        The polling loop could receive many messages in a burst.  If two coroutines
+        both read `unread_count = 3`, both compute `4`, and then both write `4`,
+        one increment is lost.  This SQL form (`count + 1`) lets the DB engine
+        apply the increment atomically — no race condition.
+
+    Args:
+        conversation_id: Primary key of the conversation to increment.
+
+    Example:
+        # Called once per inbound message in the polling loop
+        increment_conversation_unread(db, conversation_id=conv["id"])
+    """
+    db.execute(
+        "UPDATE conversations SET unread_count = unread_count + 1 WHERE id = ?",
+        (conversation_id,),
+    )
+    db.commit()
+
+
+# ===========================================================================
+# list_expired_messages — 404 vibe TTL cleanup helper
+# ===========================================================================
+
+def list_expired_messages(
+    db: sqlite3.Connection,
+    *,
+    now_iso: str,
+) -> list[dict]:
+    """
+    Return all messages that have passed their TTL and are eligible for deletion.
+
+    A message is purgeable when ALL of these are true:
+      1. expires_at is set (i.e. the message was sent under the 404 vibe).
+      2. expires_at <= now (the 24-hour countdown has finished).
+      3. is_pinned = 0 (the message was NOT saved via the pin escape hatch).
+
+    The messaging layer's background purge job calls this to find rows to delete.
+
+    Args:
+        now_iso: Current UTC time as an ISO-8601 string.
+                 SQLite compares TEXT timestamps lexicographically,
+                 so ISO-8601 format is required.
+
+    Returns:
+        List of message dicts ready for deletion.
+
+    Example:
+        from datetime import datetime, timezone
+        expired = list_expired_messages(db, now_iso=datetime.now(timezone.utc).isoformat())
+        for msg in expired:
+            db.execute("DELETE FROM messages WHERE id = ?", (msg["id"],))
+        db.commit()
+    """
+    rows = db.execute(
+        """
+        SELECT * FROM messages
+        WHERE expires_at IS NOT NULL
+          AND expires_at <= ?
+          AND is_pinned  = 0
+        ORDER BY expires_at ASC
+        """,
+        (now_iso,),
+    ).fetchall()
+    return _rows_to_list(rows)
+
+
+# ===========================================================================
+# purge_expired_messages — batch TTL purge in a single SQL statement
+# ===========================================================================
+
+def purge_expired_messages(
+    db: sqlite3.Connection,
+    *,
+    now_iso: str,
+) -> int:
+    """
+    Delete ALL expired, unpinned 404-vibe messages in one SQL statement.
+
+    Why this exists alongside list_expired_messages():
+        list_expired_messages() returns rows so the caller can inspect or log
+        them before deletion.  purge_expired_messages() is the fast path used
+        by the scheduled background job when logging is not needed.
+
+    A message is deleted when ALL of the following are true:
+      1. expires_at is set (the message was sent under the 404 vibe).
+      2. expires_at <= now (the 24-hour countdown has finished).
+      3. is_pinned = 0 (the admin has NOT used the escape hatch).
+
+    Args:
+        now_iso: Current UTC time as an ISO-8601 string.
+
+    Returns:
+        The number of rows deleted (0 if nothing was expired).
+
+    Example:
+        from datetime import datetime, timezone
+        deleted = purge_expired_messages(
+            db, now_iso=datetime.now(timezone.utc).isoformat()
+        )
+        print(f"Purged {deleted} expired message(s).")
+    """
+    cursor = db.execute(
+        """
+        DELETE FROM messages
+        WHERE expires_at IS NOT NULL
+          AND expires_at <= ?
+          AND is_pinned  = 0
+        """,
+        (now_iso,),
+    )
+    db.commit()
+    # rowcount tells us how many rows the DELETE actually removed.
+    return cursor.rowcount

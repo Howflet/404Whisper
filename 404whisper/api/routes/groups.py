@@ -33,6 +33,8 @@ from importlib import import_module
 
 _db_module = import_module("404whisper.storage.db")
 _queries   = import_module("404whisper.storage.queries")
+_ws        = import_module("404whisper.api.ws")          # WebSocket broadcast manager
+_vibes     = import_module("404whisper.api.schemas.vibes")  # vibe classification sets
 
 get_db = _db_module.get_db
 DbConn = Annotated[sqlite3.Connection, Depends(get_db)]
@@ -295,6 +297,32 @@ async def update_group(group_id: int, request: PatchGroupRequest, db: DbConn):
     member_count = db.execute(
         "SELECT COUNT(*) FROM group_members WHERE group_id = ?", (group_id,)
     ).fetchone()[0]
+
+    # Broadcast a vibe_changed event whenever the group vibe was actually set
+    # (not cleared — clearing is a reset, not a content event).
+    if "vibe" in updates and updates["vibe"] is not None:
+        # Find the group's conversation so the frontend knows which chat updated.
+        conv = _queries.get_conversation_by_group(db, group_id=group_id)
+        conv_id = conv["id"] if conv else None
+
+        # Find out who made the change (the local user's session ID).
+        changer = db.execute("SELECT session_id FROM identities LIMIT 1").fetchone()
+        changer_id = changer["session_id"] if changer else None
+
+        new_vibe = updates["vibe"]
+        await _ws.manager.broadcast({
+            "event": "vibe_changed",
+            "payload": {
+                "conversationId":    conv_id,
+                "newVibe":           new_vibe,
+                "changedBySessionId": changer_id,
+                # None until cooldown is actually set; None means no restriction.
+                "cooldownUntil":     updates.get("vibe_cooldown_until"),
+                # True when the vibe affects messaging behaviour (not just visual style).
+                "isBehavioral":      new_vibe in _vibes.BEHAVIORAL_VIBES | _vibes.WILDCARD_VIBES,
+            },
+        })
+
     return _group_to_response(updated, member_count)
 
 

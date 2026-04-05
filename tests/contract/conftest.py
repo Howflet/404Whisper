@@ -23,9 +23,13 @@ async def client() -> AsyncClient:
     app = app_module.app
 
     # Override the DB dependency with an in-memory connection for isolation.
+    # check_same_thread=False is required for WebSocket tests: Starlette's TestClient
+    # runs the ASGI app in a background thread, but the connection is created here in
+    # the main thread.  Without this flag SQLite raises ProgrammingError on every
+    # cross-thread access.
     db_module = pkg("storage.db")
     import sqlite3
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     db_module.init_schema(conn)

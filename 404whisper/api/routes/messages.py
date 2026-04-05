@@ -23,6 +23,7 @@ from importlib import import_module
 
 _db_module = import_module("404whisper.storage.db")
 _queries   = import_module("404whisper.storage.queries")
+_ws        = import_module("404whisper.api.ws")   # WebSocket broadcast manager
 
 get_db = _db_module.get_db
 DbConn = Annotated[sqlite3.Connection, Depends(get_db)]
@@ -104,7 +105,13 @@ async def send_message(request: SendMessageRequest, db: DbConn):
                                   last_message_at=sent_at)
 
     row = dict(db.execute("SELECT * FROM messages WHERE id = ?", (msg_id,)).fetchone())
-    return _message_to_response(row)
+    response = _message_to_response(row)
+
+    # Push a real-time event to every connected WebSocket client.
+    # Layer 4 (messaging) will also call this for *incoming* network messages.
+    await _ws.manager.broadcast({"event": "message_received", "payload": response})
+
+    return response
 
 
 def _message_to_response(row: dict) -> dict:
