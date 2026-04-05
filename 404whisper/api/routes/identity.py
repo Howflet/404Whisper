@@ -1,81 +1,90 @@
 """
-Layer 8 — API: Identity endpoints.
+api/routes/identity.py — Identity endpoints.
 
-Routes wired to Layer 1 (identity package) that are now implemented:
-  POST /api/identity/new     — generate a fresh identity, return mnemonic once
-  POST /api/identity/import  — restore identity from a mnemonic seed phrase
-  GET  /api/identity         — return current identity (no private key / mnemonic)
+  POST /api/identity/new     — create a fresh Session identity
+  POST /api/identity/import  — restore from mnemonic seed phrase
+  GET  /api/identity         — return current identity (no private key/mnemonic)
   POST /api/identity/unlock  — verify passphrase against stored keystore
   PATCH /api/identity        — update display name or personal vibe
 
-State note:
-    Identity state is kept in module-level variables for now (no DB yet).
-    Layer 7 (storage) will replace this with proper DB persistence.
+Identity row is persisted to the database so that each test gets a clean
+slate via the in-memory DB override, rather than leaking state through a
+module-level global.
+
+The keystore file (encrypted private key on disk) is still written to
+the filesystem — it is not stored in the DB.
 """
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+import sqlite3
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 
-# Layer 1 imports — all names come from the package we just built.
 from importlib import import_module
 
-_identity = import_module("404whisper.identity")
-create_identity      = _identity.create_identity
-import_from_mnemonic = _identity.import_from_mnemonic
-verify_passphrase    = _identity.verify_passphrase
+_identity_pkg = import_module("404whisper.identity")
+_db_module    = import_module("404whisper.storage.db")
+_queries      = import_module("404whisper.storage.queries")
+
+create_identity      = _identity_pkg.create_identity
+import_from_mnemonic = _identity_pkg.import_from_mnemonic
+verify_passphrase    = _identity_pkg.verify_passphrase
+MnemonicDecodeError  = _identity_pkg.MnemonicDecodeError
+
+get_db = _db_module.get_db
+
+# Reusable annotated dependency — declare once, use in every route signature.
+DbConn = Annotated[sqlite3.Connection, Depends(get_db)]
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # ---------------------------------------------------------------------------
-# Keystore path — stored next to the package, in a data/ directory.
+# Keystore path — private key lives here, NOT in the DB
 # ---------------------------------------------------------------------------
-_DATA_DIR    = Path(__file__).parent.parent.parent / "data"
+
+_DATA_DIR     = Path(__file__).parent.parent.parent / "data"
 _DATA_DIR.mkdir(exist_ok=True)
 KEYSTORE_PATH = _DATA_DIR / "keystore.json"
 
 # ---------------------------------------------------------------------------
-# In-memory state (replaced by DB in Layer 7)
+# Valid aesthetic vibes (the only ones allowed as personal vibes)
 # ---------------------------------------------------------------------------
-_identity_state: dict | None = None   # set on create or import
-_is_locked: bool = True               # True until unlock is called
+
+_AESTHETIC_VIBES = {"CAMPFIRE", "NEON", "LIBRARY", "VOID", "SUNRISE"}
 
 # ---------------------------------------------------------------------------
-# Request / Response schemas (Pydantic validates every incoming JSON body)
+# Request / Response schemas
 # ---------------------------------------------------------------------------
 
 
 class NewIdentityRequest(BaseModel):
-    """Body for POST /api/identity/new"""
+    """POST /api/identity/new"""
     passphrase: str
     displayName: Optional[str] = None
 
     @field_validator("passphrase")
     @classmethod
     def passphrase_min_length(cls, v: str) -> str:
-        # Data contract: passphrase must be at least 8 characters.
         if len(v) < 8:
             raise ValueError("passphrase must be at least 8 characters")
         return v
 
     @field_validator("displayName")
     @classmethod
-    def display_name_max_length(cls, v: Optional[str]) -> Optional[str]:
-        # Data contract: display name max 64 characters.
+    def display_name_valid(cls, v: Optional[str]) -> Optional[str]:
         if v is not None and len(v) > 64:
             raise ValueError("displayName must be 64 characters or fewer")
         return v
 
 
 class ImportIdentityRequest(BaseModel):
-    """Body for POST /api/identity/import"""
+    """POST /api/identity/import"""
     mnemonic: str
     passphrase: str
 
@@ -88,37 +97,43 @@ class ImportIdentityRequest(BaseModel):
 
 
 class UnlockRequest(BaseModel):
-    """Body for POST /api/identity/unlock"""
+    """POST /api/identity/unlock"""
     passphrase: str
 
 
 class PatchIdentityRequest(BaseModel):
-    """Body for PATCH /api/identity"""
+    """PATCH /api/identity"""
     displayName: Optional[str] = None
-    personalVibe: Optional[str] = None   # Use sentinel to distinguish "not sent" vs null
+    personalVibe: Optional[str] = None
 
     @field_validator("displayName")
     @classmethod
-    def display_name_max_length(cls, v: Optional[str]) -> Optional[str]:
+    def display_name_valid(cls, v: Optional[str]) -> Optional[str]:
         if v is not None and len(v) > 64:
             raise ValueError("displayName must be 64 characters or fewer")
         return v
 
 
-# Valid aesthetic vibes only — behavioral vibes cannot be personal vibes.
-_AESTHETIC_VIBES = {"CAMPFIRE", "NEON", "LIBRARY", "VOID", "SUNRISE"}
-
 # ---------------------------------------------------------------------------
-# Helper
+# Helpers
 # ---------------------------------------------------------------------------
 
 
 def _validation_error(message: str, status: int = 400) -> JSONResponse:
-    """Return a standard validation error response."""
     return JSONResponse(
         status_code=status,
         content={"error": {"code": "VALIDATION_ERROR", "message": message}},
     )
+
+
+def _identity_to_response(row: dict) -> dict:
+    """Convert a DB identity row to the camelCase API response shape."""
+    return {
+        "sessionId":    row["session_id"],
+        "displayName":  row["display_name"],
+        "personalVibe": row["personal_vibe"],
+        "createdAt":    row["created_at"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -127,61 +142,66 @@ def _validation_error(message: str, status: int = 400) -> JSONResponse:
 
 
 @router.post("/identity/new", status_code=201)
-async def create_new_identity(request: NewIdentityRequest):
+async def create_new_identity(
+    request: NewIdentityRequest,
+    db: DbConn,
+):
     """
     Generate a brand-new Session identity.
 
-    Returns the mnemonic seed phrase ONCE — it is not stored.
-    The caller must display it to the user immediately.
-
-    Returns 409 if an identity already exists on this instance.
+    Returns the mnemonic seed phrase ONCE — it is not stored anywhere.
+    The caller must display it to the user immediately and never log it.
+    Returns 409 if an identity already exists on this device.
     """
-    global _identity_state, _is_locked
-
-    # Only one identity per instance (data contract).
-    if _identity_state is not None:
+    # One identity per device.
+    existing = db.execute("SELECT session_id FROM identities LIMIT 1").fetchone()
+    if existing:
         return JSONResponse(
             status_code=409,
-            content={"error": {"code": "IDENTITY_ALREADY_CREATED",
-                               "message": "An identity already exists on this device."}},
+            content={"error": {
+                "code": "IDENTITY_ALREADY_CREATED",
+                "message": "An identity already exists on this device.",
+            }},
         )
 
     result = create_identity(passphrase=request.passphrase, keystore_path=KEYSTORE_PATH)
 
-    _identity_state = {
-        "sessionId"   : result["session_id"],
-        "displayName" : request.displayName,
-        "personalVibe": None,
-        "createdAt"   : result["created_at"],
-    }
-    _is_locked = False   # freshly created — treat as unlocked
+    # Persist to DB — display_name and personal_vibe start as NULL.
+    _queries.create_identity(
+        db,
+        session_id=result["session_id"],
+        display_name=request.displayName,
+    )
 
     # Mnemonic is returned here and ONLY here.
     return {
-        "sessionId" : result["session_id"],
-        "mnemonic"  : result["mnemonic"],
-        "createdAt" : result["created_at"],
+        "sessionId": result["session_id"],
+        "mnemonic":  result["mnemonic"],
+        "createdAt": result["created_at"],
     }
 
 
 @router.post("/identity/import", status_code=201)
-async def import_identity(request: ImportIdentityRequest):
+async def import_identity(
+    request: ImportIdentityRequest,
+    db: DbConn,
+):
     """
     Restore a Session identity from a mnemonic seed phrase.
 
     Returns 409 if an identity already exists.
     Returns 422 if the mnemonic is invalid or has a bad checksum.
     """
-    global _identity_state, _is_locked
-
-    if _identity_state is not None:
+    existing = db.execute("SELECT session_id FROM identities LIMIT 1").fetchone()
+    if existing:
         return JSONResponse(
             status_code=409,
-            content={"error": {"code": "IDENTITY_ALREADY_CREATED",
-                               "message": "An identity already exists on this device."}},
+            content={"error": {
+                "code": "IDENTITY_ALREADY_CREATED",
+                "message": "An identity already exists on this device.",
+            }},
         )
 
-    MnemonicDecodeError = _identity.MnemonicDecodeError
     try:
         result = import_from_mnemonic(
             mnemonic=request.mnemonic,
@@ -194,15 +214,9 @@ async def import_identity(request: ImportIdentityRequest):
             content={"error": {"code": "SEED_PHRASE_INVALID", "message": str(exc)}},
         )
 
-    _identity_state = {
-        "sessionId"   : result["session_id"],
-        "displayName" : None,
-        "personalVibe": None,
-        "createdAt"   : result["created_at"],
-    }
-    _is_locked = False
+    _queries.create_identity(db, session_id=result["session_id"], display_name=None)
 
-    # Mnemonic is NOT echoed back on import (data contract).
+    # Mnemonic is NOT echoed back on import.
     return {
         "sessionId": result["session_id"],
         "createdAt": result["created_at"],
@@ -210,58 +224,55 @@ async def import_identity(request: ImportIdentityRequest):
 
 
 @router.get("/identity")
-async def get_identity():
+async def get_identity(db: DbConn):
     """
     Return the current identity (no private key, no mnemonic — ever).
-
     Returns 404 if no identity has been created yet.
     """
-    if _identity_state is None:
+    row = db.execute("SELECT * FROM identities LIMIT 1").fetchone()
+    if row is None:
         return JSONResponse(
             status_code=404,
             content={"error": {"code": "NOT_FOUND", "message": "No identity found."}},
         )
-    return _identity_state
+    return _identity_to_response(dict(row))
 
 
 @router.post("/identity/unlock")
 async def unlock_identity(request: UnlockRequest):
     """
-    Verify passphrase and mark the session as unlocked.
-
-    Returns {"ok": true} on success.
-    Returns 400 on wrong passphrase.
+    Verify passphrase against the on-disk keystore.
+    Returns {"ok": true} on success, 400 on wrong passphrase.
     """
-    global _is_locked
-
     if not verify_passphrase(request.passphrase, KEYSTORE_PATH):
         return _validation_error("Incorrect passphrase.", status=400)
-
-    _is_locked = False
     return {"ok": True}
 
 
 @router.patch("/identity")
-async def update_identity(request: PatchIdentityRequest):
+async def update_identity(
+    request: PatchIdentityRequest,
+    db: DbConn,
+):
     """
-    Update display name and / or personal vibe.
+    Update display name and/or personal vibe.
 
-    Only aesthetic vibes are allowed as personal vibes (data contract).
-    Behavioral vibes (404, CONFESSIONAL, etc.) are group-only.
+    Only aesthetic vibes (CAMPFIRE, NEON, LIBRARY, VOID, SUNRISE) are allowed
+    as personal vibes — behavioral vibes are group-only.
     """
-    global _identity_state
-
-    if _identity_state is None:
+    row = db.execute("SELECT * FROM identities LIMIT 1").fetchone()
+    if row is None:
         return JSONResponse(
             status_code=404,
             content={"error": {"code": "NOT_FOUND", "message": "No identity found."}},
         )
 
-    # Apply display name update.
-    if request.displayName is not None:
-        _identity_state = {**_identity_state, "displayName": request.displayName}
+    session_id = row["session_id"]
+    updates: dict = {}
 
-    # Apply personal vibe update (None clears it; omitted field is ignored).
+    if request.displayName is not None:
+        updates["display_name"] = request.displayName
+
     if "personalVibe" in request.model_fields_set:
         vibe = request.personalVibe
         if vibe is not None and vibe not in _AESTHETIC_VIBES:
@@ -269,6 +280,10 @@ async def update_identity(request: PatchIdentityRequest):
                 f"'{vibe}' cannot be used as a personal vibe. "
                 "Only aesthetic vibes (CAMPFIRE, NEON, LIBRARY, VOID, SUNRISE) are allowed."
             )
-        _identity_state = {**_identity_state, "personalVibe": vibe}
+        updates["personal_vibe"] = vibe
 
-    return _identity_state
+    if updates:
+        _queries.update_identity(db, session_id=session_id, **updates)
+
+    updated = db.execute("SELECT * FROM identities WHERE session_id = ?", (session_id,)).fetchone()
+    return _identity_to_response(dict(updated))
