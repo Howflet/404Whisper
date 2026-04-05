@@ -89,7 +89,7 @@ class TestDbEnumSync:
     @pytest.fixture()
     def schema_sql(self) -> str:
         """Returns the CREATE TABLE SQL for all tables."""
-        storage = pkg("storage.db")
+        storage = pkg("storage.database")
         return storage.SCHEMA_SQL  # The module must expose the schema as a string constant
 
     def _extract_check_values(self, schema_sql: str, column_name: str) -> frozenset[str]:
@@ -170,7 +170,7 @@ class TestNamingConventions:
         Connect an in-memory DB, init the schema, and inspect PRAGMA table_info
         for every table to verify all column names are snake_case.
         """
-        storage = pkg("storage.db")
+        storage = pkg("storage.database")
         conn = sqlite3.connect(":memory:")
         conn.execute("PRAGMA foreign_keys = ON")
         storage.init_schema(conn)
